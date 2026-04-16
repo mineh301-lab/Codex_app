@@ -273,7 +273,13 @@ _KIWOOM_DEFAULT_MAX_WORKERS = 8
 _KIWOOM_HTTP_TIMEOUT_SEC = 10
 _KIWOOM_MAX_RETRIES = 3
 _KIWOOM_RETRY_BACKOFF_BASE_SEC = 2
-_KIWOOM_MAX_PAGES = 6                # 200행 × 6 = 1200행 (~10시간 분량)
+# NOTE:
+# ka90008 페이지당 행 수는 시장 상황/서버 응답에 따라 200보다 훨씬 작게 내려오는 경우가 있다.
+# (실측 예: 25~30행/페이지). 기존 6페이지 상한에서는 장중 후반(예: 14:40대) 조회 시
+# 09:00 구간이 잘리고 12시대부터만 남는 케이스가 발생했다.
+# 여유 있게 20페이지로 확장해 장중 전구간(09:00~15:30) 보존 확률을 높인다.
+_KIWOOM_MAX_PAGES = 20
+_KIWOOM_MAX_PAGES_HARD_CAP = 80          # 동적 확장 상한 (무한확장 방지)
 
 
 def _kiwoom_token_cache_path() -> str:
@@ -487,12 +493,19 @@ def _kiwoom_post_one_page(url: str, headers: dict, body: dict,
 
 
 def _kiwoom_fetch_program_trade(stk_cd: str, date_yyyymmdd: str,
-                                auth: KiwoomAuth) -> Optional[List[dict]]:
-    """ka90008 호출 (cont-yn 페이지네이션 자동 처리). 실패 None, 빈 응답 []."""
+                                auth: KiwoomAuth,
+                                max_pages: int = _KIWOOM_MAX_PAGES
+                                ) -> Tuple[Optional[List[dict]], bool]:
+    """
+    ka90008 호출 (cont-yn 페이지네이션 자동 처리).
+    반환:
+      - rows: 실패 None, 빈 응답 []
+      - hit_max_pages: 페이지 상한 도달로 강제 종료됐는지 여부
+    """
     token = auth.get_token()
     if not token:
         log.error(f"[KA90008] {stk_cd} | 토큰 없음 → 스킵")
-        return None
+        return None, False
 
     url = KIWOOM_BASE_URL + KIWOOM_KA90008_ENDPOINT
     base_headers = {
@@ -505,7 +518,7 @@ def _kiwoom_fetch_program_trade(stk_cd: str, date_yyyymmdd: str,
     all_rows: List[dict] = []
     cont_yn = "N"; next_key = ""
 
-    for page in range(1, _KIWOOM_MAX_PAGES + 1):
+    for page in range(1, max_pages + 1):
         headers = dict(base_headers)
         if page > 1:
             headers["cont-yn"] = "Y"
@@ -514,7 +527,7 @@ def _kiwoom_fetch_program_trade(stk_cd: str, date_yyyymmdd: str,
         data, cont_yn, next_key = _kiwoom_post_one_page(url, headers, body, stk_cd, page)
         if data is None:
             if page == 1:
-                return None
+                return None, False
             log.warning(f"[KA90008] {stk_cd} | p{page}부터 실패 → 누적 {len(all_rows)}행만 반환")
             break
 
@@ -525,11 +538,55 @@ def _kiwoom_fetch_program_trade(stk_cd: str, date_yyyymmdd: str,
             log.info(f"[KA90008] {stk_cd} | 페이징 종료 (cont_yn={cont_yn}) | 총 {page}페이지 {len(all_rows)}행")
             break
     else:
-        log.warning(f"[KA90008] ⚠️ {stk_cd} | MAX_PAGES({_KIWOOM_MAX_PAGES}) 도달. 총 {len(all_rows)}행")
+        log.warning(f"[KA90008] ⚠️ {stk_cd} | MAX_PAGES({max_pages}) 도달. 총 {len(all_rows)}행")
+        if len(all_rows) > 0:
+            _oldest_tm = _kiwoom_normalize_tm((all_rows[-1] or {}).get("tm", ""))
+            if _oldest_tm:
+                log.warning(f"[KA90008] {stk_cd} | 상한 도달 시점 oldest_tm={_oldest_tm}")
+        if len(all_rows) == 0:
+            return all_rows, True
+        return all_rows, True
 
     if len(all_rows) == 0:
         log.warning(f"[KA90008] ⚠️ {stk_cd} | 전체 응답 0행")
-    return all_rows
+    return all_rows, False
+
+
+def _kiwoom_oldest_tm(rows: List[dict]) -> str:
+    """rows(최신→과거)에서 가장 오래된 tm(HHMMSS) 반환. 없으면 빈 문자열."""
+    if not rows:
+        return ""
+    return _kiwoom_normalize_tm((rows[-1] or {}).get("tm", ""))
+
+
+def _kiwoom_fetch_program_trade_adaptive(stk_cd: str, date_yyyymmdd: str,
+                                         auth: KiwoomAuth) -> Optional[List[dict]]:
+    """
+    페이지 상한에 걸려 오전(09:00) 구간이 잘린 경우 max_pages를 동적으로 늘려 재수신.
+    - 조건: 상한 도달(hit_max_pages=True) && oldest_tm > 09:00:00
+    - 확장: 기본값에서 2배씩 증가, _KIWOOM_MAX_PAGES_HARD_CAP까지
+    """
+    pages = max(1, int(_KIWOOM_MAX_PAGES))
+    while True:
+        rows, hit_max_pages = _kiwoom_fetch_program_trade(stk_cd, date_yyyymmdd, auth, max_pages=pages)
+        if rows is None:
+            return None
+
+        oldest_tm = _kiwoom_oldest_tm(rows)
+        needs_backfill = bool(oldest_tm and oldest_tm > "090000")
+
+        if not (hit_max_pages and needs_backfill):
+            return rows
+
+        if pages >= _KIWOOM_MAX_PAGES_HARD_CAP:
+            log.warning(f"[KA90008] {stk_cd} | 동적확장 상한({_KIWOOM_MAX_PAGES_HARD_CAP}) 도달 "
+                        f"(oldest_tm={oldest_tm})")
+            return rows
+
+        next_pages = min(_KIWOOM_MAX_PAGES_HARD_CAP, pages * 2)
+        log.info(f"[KA90008] {stk_cd} | 데이터 절단 의심(oldest_tm={oldest_tm}) → "
+                 f"max_pages {pages}→{next_pages} 재수신")
+        pages = next_pages
 
 
 def _kiwoom_calc_latest_ratio(rows: List[dict]) -> Optional[float]:
@@ -679,7 +736,7 @@ def _kiwoom_fetch_parallel(
     success = 0; fail = 0; empty = 0
 
     def _one(code: str):
-        rows = _kiwoom_fetch_program_trade(code, date_yyyymmdd, auth)
+        rows = _kiwoom_fetch_program_trade_adaptive(code, date_yyyymmdd, auth)
         if rows is None:
             return code, None, None
         return code, rows, _kiwoom_calc_latest_ratio(rows)
